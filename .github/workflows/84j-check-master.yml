@@ -1,0 +1,96 @@
+# Builds every "[84j] " patch (optional ones included) on top of upstream's master branch and
+# runs the unit tests. Nothing is published: this catches a patch that no longer applies or
+# compiles before the next Mailspring release needs it.
+
+name: 84j patches vs upstream master
+
+on:
+  push:
+    branches: [84j]
+    paths-ignore: ["**.md"]
+  schedule:
+    - cron: "41 6 * * 1" # weekly, Monday
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update -q
+          apt-get install -y --no-install-recommends \
+            ca-certificates git sudo curl \
+            autoconf automake build-essential clang cmake libtool pkg-config \
+            libc-ares-dev libctemplate-dev libcurl4-openssl-dev libglib2.0-dev libicu-dev \
+            liblzma-dev libsasl2-dev libsasl2-modules libsasl2-modules-gssapi-mit libssl-dev \
+            libtidy-dev libxml2-dev uuid-dev zlib1g-dev
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: src
+
+      - name: Apply all patches to upstream master
+        working-directory: src
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          git config --global user.name "84j build"
+          git config --global user.email "build@users.noreply.github.com"
+          git remote add upstream https://github.com/Foundry376/Mailspring-Sync.git
+          git fetch -q upstream
+          patch_branch=$(git rev-parse HEAD)
+          base=$(git merge-base "$patch_branch" upstream/master)
+          git log --reverse --format='%H %s' "${base}..${patch_branch}" | awk '$2 == "[84j]" {print $1}' > ../patches.txt
+          git checkout -q -b check upstream/master
+          echo "Upstream master: $(git log -1 --format='%h %s')"
+          while read -r p; do
+            subject=$(git log -1 --format=%s "$p")
+            if ! git cherry-pick -x "$p" >/dev/null 2>&1; then
+              echo "::error::Patch does not apply to upstream master: $subject"
+              exit 1
+            fi
+            echo "Applied: $subject"
+          done < ../patches.txt
+
+      - name: Build
+        working-directory: src
+        run: |
+          mkdir -p ../app/dist
+          MAKEFLAGS="-j$(nproc)" bash ./build.sh
+          test -x ../app/mailsync.bin
+
+      - name: Unit tests
+        working-directory: src
+        run: |
+          set -euo pipefail
+          make vcard_test msgraph_contacts_test
+          ./vcard_test
+          ./msgraph_contacts_test
+
+  report-failure:
+    needs: check
+    if: failure()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Open or update an issue
+        run: |
+          set -euo pipefail
+          title="Patches no longer build on upstream master"
+          body="The [patch check](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) failed: a patch on 84j no longer applies to or compiles on Foundry376/Mailspring-Sync master. The next Mailspring release will likely need the patch updated."
+          existing=$(gh issue list -R "${{ github.repository }}" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" -R "${{ github.repository }}" --body "$body"
+          else
+            gh issue create -R "${{ github.repository }}" --title "$title" --body "$body"
+          fi
