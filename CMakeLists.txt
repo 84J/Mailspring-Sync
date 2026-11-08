@@ -69,6 +69,8 @@ IF(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
   # Unit tests for code with no mailcore dependency: make vcard_test && ./vcard_test
   add_executable(vcard_test EXCLUDE_FROM_ALL test/unit/vcard_test.cpp MailSync/VCard.cpp
     Vendor/StanfordCPPLib/strlib.cpp Vendor/StanfordCPPLib/error.cpp)
+  add_executable(msgraph_contacts_test EXCLUDE_FROM_ALL test/unit/msgraph_contacts_test.cpp
+    MailSync/MicrosoftContactsVCard.cpp)
   add_executable(graph_ics_test EXCLUDE_FROM_ALL test/unit/graph_ics_test.cpp MailSync/GraphICS.cpp
     Vendor/StanfordCPPLib/strlib.cpp Vendor/StanfordCPPLib/error.cpp
     Vendor/icalendarlib/icalendar.cpp Vendor/icalendarlib/date.cpp Vendor/icalendarlib/types.cpp)

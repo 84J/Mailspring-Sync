@@ -18,6 +18,7 @@
 #include "MailUtils.hpp"
 #include "DAVWorker.hpp"
 #include "MicrosoftCalendarWorker.hpp"
+#include "MicrosoftContactsWorker.hpp"
 #include "DAVUtils.hpp"
 #include "GoogleContactsWorker.hpp"
 #include "File.hpp"
@@ -1477,6 +1478,12 @@ void TaskProcessor::performRemoteDestroyContact(Task * task) {
         for (auto & contact : deleted) {
             gpeople->deleteContact(contact);
         }
+    } else if (MicrosoftContactsWorker::appliesTo(account)) {
+        auto deleted = store->findLargeSet<Contact>("id", contactIds);
+        auto graph = make_shared<MicrosoftContactsWorker>(account);
+        for (auto & contact : deleted) {
+            graph->deleteContact(contact);
+        }
     } else {
 
         auto deleted = store->findLargeSet<Contact>("id", contactIds);
@@ -1703,6 +1710,9 @@ void TaskProcessor::performRemoteSyncbackContact(Task * task) {
     if (account->provider() == "gmail") {
         auto gpeople = make_shared<GoogleContactsWorker>(account);
         gpeople->upsertContact(contact);
+    } else if (MicrosoftContactsWorker::appliesTo(account)) {
+        auto graph = make_shared<MicrosoftContactsWorker>(account);
+        graph->upsertContact(contact);
     } else {
         auto dav = make_shared<DAVWorker>(account);
         dav->writeAndResyncContact(contact);

@@ -40,6 +40,7 @@
 #include "DAVWorker.hpp"
 #include "GoogleContactsWorker.hpp"
 #include "MicrosoftCalendarWorker.hpp"
+#include "MicrosoftContactsWorker.hpp"
 #include "SearchWorker.hpp"
 #include "SyncException.hpp"
 #include "Task.hpp"
@@ -71,6 +72,7 @@ shared_ptr<SyncWorker> fgWorker = nullptr;
 shared_ptr<DAVWorker> davWorker = nullptr;
 shared_ptr<GoogleContactsWorker> contactsWorker = nullptr;
 shared_ptr<MicrosoftCalendarWorker> microsoftCalendarWorker = nullptr;
+shared_ptr<MicrosoftContactsWorker> microsoftContactsWorker = nullptr;
 shared_ptr<SearchWorker> searchWorker = nullptr;
 
 shared_ptr<MetadataWorker> metadataWorker = nullptr;
@@ -350,6 +352,9 @@ void runCalContactsSyncWorker() {
                 lastContactSync = now;
                 if (contactsWorker) {
                     contactsWorker->run();
+                }
+                if (microsoftContactsWorker) {
+                    microsoftContactsWorker->run(); // logs failures instead of throwing
                 }
                 davWorker->runContacts();
             }
@@ -1350,6 +1355,9 @@ string exectuablePath = argv[0];
             }
             if (account->syncsCalendarsViaGraph()) {
                 microsoftCalendarWorker = make_shared<MicrosoftCalendarWorker>(account);
+            }
+            if (MicrosoftContactsWorker::appliesTo(account)) {
+                microsoftContactsWorker = make_shared<MicrosoftContactsWorker>(account);
             }
             davWorker = make_shared<DAVWorker>(account);
             runCalContactsSyncWorker();
