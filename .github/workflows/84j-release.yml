@@ -1,0 +1,261 @@
+# Builds the Mailspring sync engine (mailsync) for Debian 13 / amd64 with this fork's
+# patches, for each official Mailspring release.
+#
+# Patches are the commits on this branch whose subject starts with "[84j] ". For a release,
+# the engine commit that Foundry376/Mailspring pins (its `mailsync` submodule) is checked out
+# and the patches are cherry-picked onto it in order.
+#   - A required patch that doesn't apply or breaks the build fails the run (and opens an issue).
+#   - A patch with the trailer "84j-Optional: true" is skipped when it doesn't apply or breaks
+#     the build (e.g. it needs engine code that only a later release contains).
+#
+# The result is published as release "mailspring-<version>" with:
+#   mailsync-<version>-debian13-amd64.tar.gz   mailsync wrapper, mailsync.bin, bundled libsasl2
+#   ...tar.gz.sha256                           checksum
+#   runtime-deps.txt                           Debian packages mailsync.bin links against
+#   BUILD_INFO.txt                             engine commit, applied and skipped patches
+
+name: 84j engine release
+
+on:
+  schedule:
+    - cron: "23 5 * * *" # daily: build when Mailspring has published a new release
+  workflow_dispatch:
+    inputs:
+      mailspring_version:
+        description: "Mailspring version to build (empty = latest release)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if the release already exists"
+        type: boolean
+        default: false
+  push:
+    branches: [84j]
+    paths-ignore: ["**.md"]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: 84j-release
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.r.outputs.version }}
+      engine_sha: ${{ steps.r.outputs.engine_sha }}
+      build: ${{ steps.r.outputs.build }}
+    steps:
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ github.event.inputs.mailspring_version }}
+          INPUT_FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION:-}"
+          if [ -z "$version" ]; then
+            version=$(gh api repos/Foundry376/Mailspring/releases/latest --jq .tag_name)
+          fi
+          engine_sha=$(gh api "repos/Foundry376/Mailspring/contents/mailsync?ref=${version}" --jq .sha)
+          echo "Mailspring ${version} pins engine ${engine_sha}"
+
+          build=true
+          # The daily run only builds releases that don't have an engine yet. Manual runs with
+          # "force" and pushes to the patch branch always rebuild.
+          if [ "${{ github.event_name }}" = "schedule" ] || { [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${INPUT_FORCE}" != "true" ]; }; then
+            if gh release view "mailspring-${version}" -R "${{ github.repository }}" >/dev/null 2>&1; then
+              echo "Release mailspring-${version} already exists - nothing to do."
+              build=false
+            fi
+          fi
+          {
+            echo "version=${version}"
+            echo "engine_sha=${engine_sha}"
+            echo "build=${build}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      ENGINE_SHA: ${{ needs.resolve.outputs.engine_sha }}
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update -q
+          apt-get install -y --no-install-recommends \
+            ca-certificates git sudo curl file dpkg-dev \
+            autoconf automake build-essential clang cmake libtool pkg-config \
+            libc-ares-dev libctemplate-dev libcurl4-openssl-dev libglib2.0-dev libicu-dev \
+            liblzma-dev libsasl2-dev libsasl2-modules libsasl2-modules-gssapi-mit libssl-dev \
+            libtidy-dev libxml2-dev uuid-dev zlib1g-dev
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: src
+
+      - name: Apply patches to the engine Mailspring ${{ env.VERSION }} uses
+        working-directory: src
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          git config --global user.name "84j build"
+          git config --global user.email "build@users.noreply.github.com"
+          git remote add upstream https://github.com/Foundry376/Mailspring-Sync.git
+          git fetch -q upstream
+          patch_branch=$(git rev-parse HEAD)
+          base=$(git merge-base "$patch_branch" upstream/master)
+
+          # Patches, oldest first: commits after the fork point whose subject starts with "[84j] "
+          git log --reverse --format='%H %s' "${base}..${patch_branch}" | awk '$2 == "[84j]" {print $1}' > ../patches.txt
+          echo "Patches on the branch:"; while read -r p; do git log -1 --format='  %h %s' "$p"; done < ../patches.txt
+
+          git checkout -q -b build "$ENGINE_SHA"
+          : > ../applied.txt; : > ../skipped.txt
+          while read -r p; do
+            subject=$(git log -1 --format=%s "$p")
+            optional=$(git log -1 --format='%(trailers:key=84j-Optional,valueonly)' "$p" | tr -d '[:space:]')
+            if git cherry-pick -x "$p" >/dev/null 2>&1; then
+              echo "$p $subject" >> ../applied.txt
+              echo "Applied: $subject"
+            else
+              git cherry-pick --abort || true
+              if [ "$optional" = "true" ]; then
+                echo "$p $subject (does not apply to this engine version)" >> ../skipped.txt
+                echo "Skipped optional patch (does not apply): $subject"
+              else
+                echo "::error::Required patch does not apply to engine ${ENGINE_SHA}: $subject"
+                exit 1
+              fi
+            fi
+          done < ../patches.txt
+          git submodule update --init --recursive || true
+
+      - name: Build
+        working-directory: src
+        run: |
+          set -euo pipefail
+          build() {
+            git clean -fdxq
+            rm -rf ../app && mkdir -p ../app/dist
+            MAKEFLAGS="-j$(nproc)" bash ./build.sh
+          }
+          if ! build; then
+            # An optional patch can apply cleanly and still not compile against an older
+            # engine. Rebuild with only the required patches that were applied.
+            echo "::warning::Build failed; retrying without optional patches"
+            git checkout -q -f -B build "$ENGINE_SHA"
+            : > ../applied2.txt
+            while read -r p subject; do
+              [ -z "$p" ] && continue
+              optional=$(git log -1 --format='%(trailers:key=84j-Optional,valueonly)' "$p" | tr -d '[:space:]')
+              if [ "$optional" = "true" ]; then
+                echo "$p $subject (breaks the build on this engine version)" >> ../skipped.txt
+                continue
+              fi
+              git cherry-pick -x "$p" >/dev/null
+              echo "$p $subject" >> ../applied2.txt
+            done < ../applied.txt
+            mv ../applied2.txt ../applied.txt
+            build
+          fi
+          test -f ../app/dist/mailsync.tar.gz
+
+      - name: Unit tests
+        working-directory: src
+        run: |
+          set -euo pipefail
+          if [ -f test/unit/msgraph_contacts_test.cpp ]; then
+            make msgraph_contacts_test && ./msgraph_contacts_test
+          else
+            echo "Contacts patch not applied - no contacts test."
+          fi
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          out="mailsync-${VERSION}-debian13-amd64.tar.gz"
+          mkdir -p dist
+          cp app/dist/mailsync.tar.gz "dist/${out}"
+          (cd dist && sha256sum "${out}" > "${out}.sha256")
+
+          # Debian packages mailsync.bin needs at runtime (libsasl2 is bundled in the tarball).
+          mkdir -p check && tar -xzf "dist/${out}" -C check
+          ldd check/mailsync.bin | awk '/=> \// {print $3}' | while read -r lib; do
+            real=$(readlink -f "$lib")
+            dpkg -S "$real" 2>/dev/null || dpkg -S "$lib" 2>/dev/null || true
+          done | cut -d: -f1 | sort -u | grep -v -E '^(libc6|libgcc-s1|libstdc\+\+6)$' > dist/runtime-deps.txt || true
+          echo "Runtime dependencies:"; cat dist/runtime-deps.txt
+
+          {
+            echo "Mailspring version: ${VERSION}"
+            echo "Engine commit (Foundry376/Mailspring-Sync): ${ENGINE_SHA}"
+            echo "Patch branch commit: ${GITHUB_SHA}"
+            echo "Built: $(date -u +%Y-%m-%dT%H:%M:%SZ) on Debian $(cat /etc/debian_version)"
+            echo
+            echo "Applied patches:"
+            sed 's/^[0-9a-f]* /  - /' applied.txt
+            echo
+            echo "Skipped optional patches:"
+            if [ -s skipped.txt ]; then sed 's/^[0-9a-f]* /  - /' skipped.txt; else echo "  (none)"; fi
+          } > dist/BUILD_INFO.txt
+          cat dist/BUILD_INFO.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine
+          path: dist/
+          retention-days: 7
+
+  release:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: engine
+          path: dist
+      - name: Publish release mailspring-${{ env.VERSION }}
+        run: |
+          set -euo pipefail
+          tag="mailspring-${VERSION}"
+          if gh release view "$tag" -R "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release edit "$tag" -R "${{ github.repository }}" --notes-file dist/BUILD_INFO.txt
+            gh release upload "$tag" -R "${{ github.repository }}" --clobber dist/*
+          else
+            gh release create "$tag" -R "${{ github.repository }}" --target "${{ github.sha }}" \
+              --title "Mailspring ${VERSION} engine (Debian 13, amd64)" \
+              --notes-file dist/BUILD_INFO.txt dist/*
+          fi
+
+  report-failure:
+    needs: [resolve, build, release]
+    if: failure()
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Open or update an issue
+        run: |
+          set -euo pipefail
+          title="Engine build failed for Mailspring ${VERSION:-unknown}"
+          body="The [84j engine release run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) failed. Most likely a required patch no longer applies to the engine this Mailspring release uses, or the engine no longer builds on Debian 13. The previous engine release stays available."
+          existing=$(gh issue list -R "${{ github.repository }}" --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" -R "${{ github.repository }}" --body "$body"
+          else
+            gh issue create -R "${{ github.repository }}" --title "$title" --body "$body"
+          fi
