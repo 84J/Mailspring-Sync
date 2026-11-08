@@ -71,6 +71,19 @@ class CleanHTMLBodyRendererTemplateCallback : public Object, public HTMLRenderer
 //    }
 };
 
+// Unthreaded mode: when MAILSYNC_UNTHREADED is 1/true/yes, every message gets its own
+// thread instead of joining a conversation, so the client's thread list becomes a plain
+// chronological list of messages. Only affects messages synced from now on; existing
+// accounts need "Rebuild Cache" to be re-synced without conversations.
+static bool unthreadedMode() {
+    static const bool enabled = [] {
+        string value = MailUtils::getEnvUTF8("MAILSYNC_UNTHREADED");
+        transform(value.begin(), value.end(), value.begin(), ::tolower);
+        return value == "1" || value == "true" || value == "yes";
+    }();
+    return enabled;
+}
+
 string stringByAppendingOrSkipping(string input, string val) {
     auto valWithSpace = " " + val;
     if (input.find(valWithSpace) != std::string::npos) {
@@ -191,7 +204,9 @@ shared_ptr<Message> MailProcessor::insertMessage(IMAPMessage * mMsg, Folder & fo
 
         // Find the correct thread
 
-        if (mMsg->gmailThreadID()) {
+        if (unthreadedMode()) {
+            // Unthreaded mode: never join an existing thread; a new one is created below.
+        } else if (mMsg->gmailThreadID()) {
             Query query = Query().equal("gThrId", to_string(mMsg->gmailThreadID()));
             thread = store->find<Thread>(query);
             
